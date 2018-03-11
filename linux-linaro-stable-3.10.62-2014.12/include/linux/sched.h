@@ -1072,6 +1072,8 @@ struct task_struct {
 
 	/* added flag */
 	bool trace_fault;
+	u32 orig_inst;
+	pte_t *pte_clp;
 
 	int prio, static_prio, normal_prio;
 	unsigned int rt_priority;

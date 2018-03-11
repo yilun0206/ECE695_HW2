@@ -3685,20 +3685,31 @@ static int do_pmd_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
-static unsigned long get_fault_pc(void)
+static unsigned long get_fault_pc(struct vm_area_struct *vma, unsigned long address)
 {
 	struct task_struct * tsk = current;
 	struct pt_regs *regs;
 	unsigned long pc;
+	unsigned int flags = vma->vm_flags;
 
 	if (!tsk->trace_fault)
 		return 0;
 
 	regs = task_pt_regs(tsk);
 	pc = regs->ARM_pc;
+
+	if (flags & VM_EXEC) {
+		printk("code page fault, fault pc: %#lx, fault address: %#lx\n", pc, address);
+		/* TODO: add code page support */
+		return 0;
+	} else
+		printk("fault pc: %#lx, fault address %#lx\n", pc, address);
+
 	
 	return pc;
 }
+
+int patch_next_inst(struct mm_struct *mm, unsigned long pc);
 
 SYSCALL_DEFINE0(trace_fault)
 {
@@ -3728,9 +3739,12 @@ int handle_pte_fault(struct mm_struct *mm,
 
 	entry = *pte;
 	if (!pte_present(entry)) {
-		fault_pc = get_fault_pc();
-		if (fault_pc)
-			printk("fault pc : %lu\n", fault_pc);
+		fault_pc = get_fault_pc(vma, address);
+		if (fault_pc) {
+			/* record ptep to task_struct for future clear */
+			current->pte_clp = pte;
+			patch_next_inst(mm, fault_pc);
+		}
 		if (pte_none(entry)) {
 			if (vma->vm_ops) {
 				if (likely(vma->vm_ops->fault))
@@ -4047,6 +4061,76 @@ static inline int follow_pte(struct mm_struct *mm, unsigned long address,
 	return res;
 }
 
+/* 
+ * access_prot_mem: write to a user ro page
+ * @mm: mm_struct of current address space
+ * @address: user virtual address that need to te written
+ * @buf: overwritten content
+ * @len: length of write
+ * return value: sizeof write on success, -errno on fail
+ */
+static int access_prot_mem(struct mm_struct *mm, unsigned long address,
+			  void *buf, int len)
+{
+	int ret;
+	resource_size_t phys_addr; /* PAGE_ALIGNED */
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+	void __iomem *maddr;
+	int offset = address & (PAGE_SIZE-1);
+
+	printk("inst vaddr: %#lx, offset: %d\n", address, offset);
+
+	if (unlikely(offset + len > PAGE_SIZE))
+		return -EINVAL;
+
+	ret = follow_pte(mm, address, &ptep, &ptl);
+	if (unlikely(ret)) {
+		/* already unlocked */
+		return ret;
+	}
+
+	pte = *ptep;
+	pte_unmap_unlock(ptep, ptl);
+
+	phys_addr = (resource_size_t)pte_pfn(pte) << PAGE_SHIFT;
+	maddr = ioremap_cached(phys_addr, PAGE_SIZE);
+	memcpy_toio(maddr + offset, buf, len);
+	iounmap(maddr);
+
+	return len;
+}
+
+/* TODO: jump insts */
+static inline unsigned long find_next_inst(unsigned long pc)
+{
+	return pc + 4;
+}
+
+/*
+ * patch_next_inst: patch next inst of fault inst
+ * @mm: mm_struct point to mm of current address space
+ * @pc: current program counter, pointer to fault instruction
+ * return value: 0 on success
+ */
+int patch_next_inst(struct mm_struct *mm, unsigned long pc)
+{
+	unsigned long next_inst_vaddr; /* next inst addr */
+	int res;
+	u32 inst = 0xffffffff; /* undefined inst here */
+
+	next_inst_vaddr = find_next_inst(pc);
+	/* save orig instruction to be patched */
+	memcpy(&current->orig_inst, (void *)next_inst_vaddr, 4);
+	
+	res = access_prot_mem(mm, next_inst_vaddr, &inst, 4);
+
+	if (unlikely(res != 4)) {
+		pr_warn("fail to path inst at %lu\n", next_inst_vaddr);
+	}
+
+	return 0;
+}
 /**
  * follow_pfn - look up PFN at a user virtual address
  * @vma: memory mapping
