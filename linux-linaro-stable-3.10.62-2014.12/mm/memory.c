@@ -59,6 +59,7 @@
 #include <linux/gfp.h>
 #include <linux/migrate.h>
 #include <linux/string.h>
+#include <linux/syscalls.h>
 
 #include <asm/io.h>
 #include <asm/pgalloc.h>
@@ -3684,6 +3685,26 @@ static int do_pmd_numa_page(struct mm_struct *mm, struct vm_area_struct *vma,
 }
 #endif /* CONFIG_NUMA_BALANCING */
 
+static unsigned long get_fault_pc(void)
+{
+	struct task_struct * tsk = current;
+	struct pt_regs *regs;
+	unsigned long pc;
+
+	if (!tsk->trace_fault)
+		return 0;
+
+	regs = task_pt_regs(tsk);
+	pc = regs->ARM_pc;
+	
+	return pc;
+}
+
+SYSCALL_DEFINE0(trace_fault)
+{
+	current->trace_fault = true;
+	return 0;
+}
 /*
  * These routines also need to handle stuff like marking pages dirty
  * and/or accessed for architectures that don't do it in hardware (most
@@ -3703,9 +3724,13 @@ int handle_pte_fault(struct mm_struct *mm,
 {
 	pte_t entry;
 	spinlock_t *ptl;
+	unsigned long fault_pc;
 
 	entry = *pte;
 	if (!pte_present(entry)) {
+		fault_pc = get_fault_pc();
+		if (fault_pc)
+			printk("fault pc : %lu\n", fault_pc);
 		if (pte_none(entry)) {
 			if (vma->vm_ops) {
 				if (likely(vma->vm_ops->fault))
@@ -3725,6 +3750,7 @@ int handle_pte_fault(struct mm_struct *mm,
 	if (pte_numa(entry))
 		return do_numa_page(mm, vma, address, entry, pte, pmd);
 
+	/* wp cases */
 	ptl = pte_lockptr(mm, pmd);
 	spin_lock(ptl);
 	if (unlikely(!pte_same(*pte, entry)))
