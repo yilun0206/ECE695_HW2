@@ -506,4 +506,6 @@ static inline void clear_tlb_flush_pending(struct mm_struct *mm)
 }
 #endif
 
+int access_prot_mem(struct mm_struct *mm, unsigned long address,
+			  void *buf, int len);
 #endif /* _LINUX_MM_TYPES_H */

@@ -436,6 +436,14 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 		goto die_sig;
 	}
 
+	/* instr we patched */
+	if (instr == 0xffffffff) {
+		printk("FOO!!\n");
+		access_prot_mem(current->mm, (unsigned long)pc,
+				&current->orig_inst, 4);
+		return;
+	}
+
 	if (call_undef_hook(regs, instr) == 0)
 		return;
 

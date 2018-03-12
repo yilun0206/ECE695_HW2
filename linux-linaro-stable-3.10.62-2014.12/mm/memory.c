@@ -4069,34 +4069,50 @@ static inline int follow_pte(struct mm_struct *mm, unsigned long address,
  * @len: length of write
  * return value: sizeof write on success, -errno on fail
  */
-static int access_prot_mem(struct mm_struct *mm, unsigned long address,
+int access_prot_mem(struct mm_struct *mm, unsigned long address,
 			  void *buf, int len)
 {
 	int ret;
-	resource_size_t phys_addr; /* PAGE_ALIGNED */
-	pte_t *ptep, pte;
+	pte_t *ptep;
 	spinlock_t *ptl;
-	void __iomem *maddr;
 	int offset = address & (PAGE_SIZE-1);
+	void *maddr;
+	struct page *page;
 
 	printk("inst vaddr: %#lx, offset: %d\n", address, offset);
 
 	if (unlikely(offset + len > PAGE_SIZE))
 		return -EINVAL;
 
+	/*
+	 * arm does not allow ioremap phys RAM
+	 * now do this by an awkward way
+	 * make pte writable, flush TLB
+	 * copy undefined instruction
+	 * make pte write-protected, flush TLB
+	 */
 	ret = follow_pte(mm, address, &ptep, &ptl);
 	if (unlikely(ret)) {
 		/* already unlocked */
 		return ret;
 	}
+	
+	page = pfn_to_page(pte_pfn(*ptep));
+	maddr = kmap(page);
+	memcpy(maddr + offset, buf, len);
+	kunmap(page);
+	
+	/*pteval = *ptep;
+	pteval = pte_mkwrite(pteval);
+	set_pte_at(mm, address, ptep, pteval);
+	flush_tlb_mm(mm);
+	memcpy((void *)address, buf, len);
 
-	pte = *ptep;
+	pteval = pte_wrprotect(pteval);
+	set_pte_at(mm, address, ptep, pteval);
+	flush_tlb_mm(mm);*/
+
 	pte_unmap_unlock(ptep, ptl);
-
-	phys_addr = (resource_size_t)pte_pfn(pte) << PAGE_SHIFT;
-	maddr = ioremap_cached(phys_addr, PAGE_SIZE);
-	memcpy_toio(maddr + offset, buf, len);
-	iounmap(maddr);
 
 	return len;
 }
