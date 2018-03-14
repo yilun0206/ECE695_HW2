@@ -177,6 +177,7 @@ struct page {
 #ifdef LAST_NID_NOT_IN_PAGE_FLAGS
 	int _last_nid;
 #endif
+	short ref;
 }
 /*
  * The struct page can be forced to be double word aligned so that atomic ops
@@ -506,6 +507,5 @@ static inline void clear_tlb_flush_pending(struct mm_struct *mm)
 }
 #endif
 
-int access_prot_mem(struct mm_struct *mm, unsigned long address,
-			  void *buf, int len);
+int restore_saved_inst(unsigned long pc);
 #endif /* _LINUX_MM_TYPES_H */

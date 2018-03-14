@@ -3739,6 +3739,9 @@ int handle_pte_fault(struct mm_struct *mm,
 
 	entry = *pte;
 	if (!pte_present(entry)) {
+		int ret;
+		unsigned long pfn;
+		struct page *page;
 		fault_pc = get_fault_pc(vma, address);
 		if (fault_pc) {
 			/* record ptep to task_struct for future clear */
@@ -3747,18 +3750,45 @@ int handle_pte_fault(struct mm_struct *mm,
 		}
 		if (pte_none(entry)) {
 			if (vma->vm_ops) {
-				if (likely(vma->vm_ops->fault))
-					return do_linear_fault(mm, vma, address,
+				if (likely(vma->vm_ops->fault)) {
+					ret = do_linear_fault(mm, vma, address,
 						pte, pmd, flags, entry);
+					goto reset;
+				}
 			}
-			return do_anonymous_page(mm, vma, address,
+			ret = do_anonymous_page(mm, vma, address,
 						 pte, pmd, flags);
+			goto reset;
 		}
-		if (pte_file(entry))
-			return do_nonlinear_fault(mm, vma, address,
+		if (pte_file(entry)) {
+			ret = do_nonlinear_fault(mm, vma, address,
 					pte, pmd, flags, entry);
-		return do_swap_page(mm, vma, address,
+			goto check;
+		}
+		ret = do_swap_page(mm, vma, address,
 					pte, pmd, flags, entry);
+		goto check;
+
+reset:
+		pfn = pte_pfn(*pte);
+		if (unlikely(!pfn_valid(pfn))) {
+			printk("invalid pfn.\n");
+			return ret;
+		}
+		page = pfn_to_page(pfn);
+		WARN_ON(!page);
+		printk("page: %p, ref: %p\n", page, &page->ref);
+		//page->ref = 0;
+check:
+		/* 
+		 * do something here before return 
+		 * increment counter
+		 */
+		page = pfn_to_page(pte_pfn(*pte));
+		WARN_ON(!page);
+		//page->ref++;
+
+		return ret;
 	}
 
 	if (pte_numa(entry))
@@ -4069,7 +4099,7 @@ static inline int follow_pte(struct mm_struct *mm, unsigned long address,
  * @len: length of write
  * return value: sizeof write on success, -errno on fail
  */
-int access_prot_mem(struct mm_struct *mm, unsigned long address,
+static int access_prot_mem(struct mm_struct *mm, unsigned long address,
 			  void *buf, int len)
 {
 	int ret;
@@ -4101,16 +4131,6 @@ int access_prot_mem(struct mm_struct *mm, unsigned long address,
 	maddr = kmap(page);
 	memcpy(maddr + offset, buf, len);
 	kunmap(page);
-	
-	/*pteval = *ptep;
-	pteval = pte_mkwrite(pteval);
-	set_pte_at(mm, address, ptep, pteval);
-	flush_tlb_mm(mm);
-	memcpy((void *)address, buf, len);
-
-	pteval = pte_wrprotect(pteval);
-	set_pte_at(mm, address, ptep, pteval);
-	flush_tlb_mm(mm);*/
 
 	pte_unmap_unlock(ptep, ptl);
 
@@ -4147,6 +4167,18 @@ int patch_next_inst(struct mm_struct *mm, unsigned long pc)
 
 	return 0;
 }
+
+int restore_saved_inst(unsigned long pc)
+{
+	return access_prot_mem(current->mm, pc,
+			&current->orig_inst, 4);
+}
+
+int clear_pervious_saved_pte(void)
+{
+	
+}
+
 /**
  * follow_pfn - look up PFN at a user virtual address
  * @vma: memory mapping
