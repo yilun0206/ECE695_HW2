@@ -3716,6 +3716,52 @@ SYSCALL_DEFINE0(trace_fault)
 	current->trace_fault = true;
 	return 0;
 }
+
+static inline void reset_page_ref(pte_t *ptep)
+{
+	unsigned long pfn;
+	struct page *page;
+
+	pfn = pte_pfn(*ptep);
+	if (unlikely(!pfn_valid(pfn))) {
+		pr_warn("%s(): invalid pfn, pteval: %#lx\n",
+			__func__, (unsigned long)pte_val(*ptep));
+		return;
+	}
+	page = pfn_to_page(pfn);
+	atomic_set(&page->ref, 0);
+}
+
+static inline void inc_page_ref(pte_t *ptep)
+{
+	unsigned long pfn;
+	struct page *page;
+
+	pfn = pte_pfn(*ptep);
+	if (unlikely(!pfn_valid(pfn))) {
+		pr_warn("%s(): invalid pfn, pteval: %#lx\n",
+			__func__, (unsigned long)pte_val(*ptep));
+		return;
+	}
+	page = pfn_to_page(pfn);
+	atomic_inc(&page->ref);
+}
+
+static inline int get_page_ref(pte_t *ptep)
+{
+	unsigned long pfn;
+	struct page *page;
+
+	pfn = pte_pfn(*ptep);
+	if (unlikely(!pfn_valid(pfn))) {
+		pr_warn("%s(): invalid pfn, pteval: %#lx\n",
+			__func__, (unsigned long)pte_val(*ptep));
+		return -EINVAL;
+	}
+	page = pfn_to_page(pfn);
+	return atomic_read(&page->ref);
+}
+
 /*
  * These routines also need to handle stuff like marking pages dirty
  * and/or accessed for architectures that don't do it in hardware (most
@@ -3735,59 +3781,47 @@ int handle_pte_fault(struct mm_struct *mm,
 {
 	pte_t entry;
 	spinlock_t *ptl;
-	unsigned long fault_pc;
 
 	entry = *pte;
 	if (!pte_present(entry)) {
-		int ret;
-		unsigned long pfn;
-		struct page *page;
-		fault_pc = get_fault_pc(vma, address);
-		if (fault_pc) {
-			/* record ptep to task_struct for future clear */
-			current->pte_clp = pte;
-			patch_next_inst(mm, fault_pc);
-		}
+		int ret, count;
+		unsigned long fault_pc;
+
 		if (pte_none(entry)) {
 			if (vma->vm_ops) {
 				if (likely(vma->vm_ops->fault)) {
 					ret = do_linear_fault(mm, vma, address,
 						pte, pmd, flags, entry);
-					goto reset;
+					reset_page_ref(pte);
+					goto count;
 				}
 			}
 			ret = do_anonymous_page(mm, vma, address,
 						 pte, pmd, flags);
-			goto reset;
+			reset_page_ref(pte);
+			goto count;
 		}
 		if (pte_file(entry)) {
 			ret = do_nonlinear_fault(mm, vma, address,
 					pte, pmd, flags, entry);
-			goto check;
+			goto count;
 		}
 		ret = do_swap_page(mm, vma, address,
 					pte, pmd, flags, entry);
-		goto check;
 
-reset:
-		pfn = pte_pfn(*pte);
-		if (unlikely(!pfn_valid(pfn))) {
-			printk("invalid pfn.\n");
-			return ret;
+count:
+		inc_page_ref(pte);
+		count = get_page_ref(pte);
+		if (count < 0 || count >= 10)
+			goto out;
+		
+		fault_pc = get_fault_pc(vma, address);
+		if (fault_pc) {
+			/* record ptep to task_struct for future clear */
+			current->last_fault_addr = address;
+			patch_next_inst(mm, fault_pc);
 		}
-		page = pfn_to_page(pfn);
-		WARN_ON(!page);
-		printk("page: %p, ref: %p\n", page, &page->ref);
-		//page->ref = 0;
-check:
-		/* 
-		 * do something here before return 
-		 * increment counter
-		 */
-		page = pfn_to_page(pte_pfn(*pte));
-		WARN_ON(!page);
-		//page->ref++;
-
+out:
 		return ret;
 	}
 
@@ -4108,18 +4142,18 @@ static int access_prot_mem(struct mm_struct *mm, unsigned long address,
 	int offset = address & (PAGE_SIZE-1);
 	void *maddr;
 	struct page *page;
+	unsigned long pfn;
 
-	printk("inst vaddr: %#lx, offset: %d\n", address, offset);
+	printk("%s(): inst vaddr: %#lx, offset: %d\n",
+		__func__, address, offset);
 
 	if (unlikely(offset + len > PAGE_SIZE))
 		return -EINVAL;
 
 	/*
 	 * arm does not allow ioremap phys RAM
-	 * now do this by an awkward way
-	 * make pte writable, flush TLB
-	 * copy undefined instruction
-	 * make pte write-protected, flush TLB
+	 * but kmap is still available to map phys
+	 * MEM into kernel highmem
 	 */
 	ret = follow_pte(mm, address, &ptep, &ptl);
 	if (unlikely(ret)) {
@@ -4127,14 +4161,23 @@ static int access_prot_mem(struct mm_struct *mm, unsigned long address,
 		return ret;
 	}
 	
-	page = pfn_to_page(pte_pfn(*ptep));
+	pfn = pte_pfn(*ptep);
+	if (unlikely(!pfn_valid(pfn))) {
+		pr_warn("%s(): invalid pfn, pteval: %#lx\n",
+			__func__, (unsigned long)pte_val(*ptep));
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	page = pfn_to_page(pfn);
 	maddr = kmap(page);
 	memcpy(maddr + offset, buf, len);
 	kunmap(page);
 
+	ret = len;
+unlock:
 	pte_unmap_unlock(ptep, ptl);
-
-	return len;
+	return ret;
 }
 
 /* TODO: jump insts */
@@ -4163,6 +4206,7 @@ int patch_next_inst(struct mm_struct *mm, unsigned long pc)
 
 	if (unlikely(res != 4)) {
 		pr_warn("fail to path inst at %lu\n", next_inst_vaddr);
+		return res;
 	}
 
 	return 0;
@@ -4176,7 +4220,36 @@ int restore_saved_inst(unsigned long pc)
 
 int clear_pervious_saved_pte(void)
 {
-	
+	int ret;
+	pte_t entry, *ptep;
+	struct mm_struct *mm = current->mm;
+	unsigned long last_fault_addr = current->last_fault_addr;
+	unsigned long aligned_addr;
+	spinlock_t *ptl;
+	struct vm_area_struct *vma;
+
+	vma = find_vma(mm, last_fault_addr);
+	if (unlikely(!vma)) {
+		pr_warn("Cannot find VMA of last fault address.\n");
+		return -EINVAL;
+	}
+	aligned_addr = last_fault_addr & (~(PAGE_SIZE-1));
+
+	ret = follow_pte(mm, last_fault_addr, &ptep, &ptl);
+	if (unlikely(ret)) {
+		/* BUG */
+		pr_warn("corrupted saved last_fault_addr.\n");
+		return ret;
+	}
+
+	entry = *ptep;
+	entry = 0; /* TODO: BUG */
+	set_pte_at(mm, last_fault_addr, ptep, entry);
+	flush_tlb_range(vma, aligned_addr, aligned_addr + PAGE_SIZE);
+	current->last_fault_addr = 0;
+
+	pte_unmap_unlock(ptep, ptl);
+	return 0;
 }
 
 /**

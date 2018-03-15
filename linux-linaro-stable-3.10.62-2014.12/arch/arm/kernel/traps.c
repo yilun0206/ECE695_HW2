@@ -438,7 +438,7 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 
 	/* instr we patched */
 	if (instr == 0xffffffff) {
-		printk("FOO!!\n");
+		//printk("FOO!!\n");
 		restore_saved_inst((unsigned long) pc);
 		return;
 	}
