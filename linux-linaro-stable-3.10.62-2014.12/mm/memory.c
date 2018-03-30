@@ -3018,6 +3018,8 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	int exclusive = 0;
 	int ret = 0;
 
+	printk("%s", __func__);
+
 	if (!pte_unmap_same(mm, pmd, page_table, orig_pte))
 		goto out;
 
@@ -3692,15 +3694,14 @@ static unsigned long get_fault_pc(struct vm_area_struct *vma, unsigned long addr
 	unsigned long pc;
 	unsigned int flags = vma->vm_flags;
 
-	if (!tsk->trace_fault)
-		return 0;
-
 	regs = task_pt_regs(tsk);
 	pc = regs->ARM_pc;
 
-	if (flags & VM_EXEC) {
+	if (!current->trace_fault)
+		return 0;
+
+	if (flags & VM_EXEC && !(flags & VM_WRITE)) {
 		printk("code page fault, fault pc: %#lx, fault address: %#lx\n", pc, address);
-		/* TODO: add code page support */
 		return 0;
 	} else
 		printk("fault pc: %#lx, fault address %#lx\n", pc, address);
@@ -3711,13 +3712,8 @@ static unsigned long get_fault_pc(struct vm_area_struct *vma, unsigned long addr
 
 int patch_next_inst(struct mm_struct *mm, unsigned long pc);
 
-SYSCALL_DEFINE0(trace_fault)
-{
-	current->trace_fault = true;
-	return 0;
-}
 
-static inline void reset_page_ref(pte_t *ptep)
+static inline int reset_page_ref(pte_t *ptep)
 {
 	unsigned long pfn;
 	struct page *page;
@@ -3726,13 +3722,14 @@ static inline void reset_page_ref(pte_t *ptep)
 	if (unlikely(!pfn_valid(pfn))) {
 		pr_warn("%s(): invalid pfn, pteval: %#lx\n",
 			__func__, (unsigned long)pte_val(*ptep));
-		return;
+		return -EINVAL;
 	}
 	page = pfn_to_page(pfn);
 	atomic_set(&page->ref, 0);
+	return 0;
 }
 
-static inline void inc_page_ref(pte_t *ptep)
+static inline int inc_page_ref(pte_t *ptep)
 {
 	unsigned long pfn;
 	struct page *page;
@@ -3741,10 +3738,11 @@ static inline void inc_page_ref(pte_t *ptep)
 	if (unlikely(!pfn_valid(pfn))) {
 		pr_warn("%s(): invalid pfn, pteval: %#lx\n",
 			__func__, (unsigned long)pte_val(*ptep));
-		return;
+		return -EINVAL;
 	}
 	page = pfn_to_page(pfn);
 	atomic_inc(&page->ref);
+	return 0;
 }
 
 static inline int get_page_ref(pte_t *ptep)
@@ -3760,6 +3758,29 @@ static inline int get_page_ref(pte_t *ptep)
 	}
 	page = pfn_to_page(pfn);
 	return atomic_read(&page->ref);
+}
+
+static int do_unpresent_fault(struct mm_struct *mm,
+		struct vm_area_struct *vma, unsigned long address,
+		pte_t *pte, pmd_t *pmd)
+{
+	pte_t entry;
+	spinlock_t *ptl;
+	entry = *pte;
+
+	printk("%s\n", __func__);
+	ptl = pte_lockptr(mm, pmd);
+	spin_lock(ptl);
+	entry = current->saved_pteval;
+	set_pte_at(mm, address, pte, entry);
+	current->saved_pteval = 0;
+	pte_unmap_unlock(pte, ptl);
+	return 0;
+}
+
+static inline bool init_process(struct task_struct *tsk)
+{
+	return (tsk->pid == 1)? true : false;
 }
 
 /*
@@ -3781,24 +3802,32 @@ int handle_pte_fault(struct mm_struct *mm,
 {
 	pte_t entry;
 	spinlock_t *ptl;
+	int ret = 0;
+	int counter;
+	unsigned long fault_pc;
 
 	entry = *pte;
 	if (!pte_present(entry)) {
-		int ret, count;
-		unsigned long fault_pc;
 
 		if (pte_none(entry)) {
+			if (current->saved_pteval) {
+				ret = do_unpresent_fault(mm, vma, address,
+					pte, pmd);
+				goto count;
+			}
 			if (vma->vm_ops) {
 				if (likely(vma->vm_ops->fault)) {
 					ret = do_linear_fault(mm, vma, address,
 						pte, pmd, flags, entry);
-					reset_page_ref(pte);
+					if (reset_page_ref(pte))
+						goto out;
 					goto count;
 				}
 			}
 			ret = do_anonymous_page(mm, vma, address,
 						 pte, pmd, flags);
-			reset_page_ref(pte);
+			if (reset_page_ref(pte))
+				goto out;
 			goto count;
 		}
 		if (pte_file(entry)) {
@@ -3808,25 +3837,14 @@ int handle_pte_fault(struct mm_struct *mm,
 		}
 		ret = do_swap_page(mm, vma, address,
 					pte, pmd, flags, entry);
+		goto count;
 
-count:
-		inc_page_ref(pte);
-		count = get_page_ref(pte);
-		if (count < 0 || count >= 10)
-			goto out;
-		
-		fault_pc = get_fault_pc(vma, address);
-		if (fault_pc) {
-			/* record ptep to task_struct for future clear */
-			current->last_fault_addr = address;
-			patch_next_inst(mm, fault_pc);
-		}
-out:
-		return ret;
 	}
 
-	if (pte_numa(entry))
-		return do_numa_page(mm, vma, address, entry, pte, pmd);
+	if (pte_numa(entry)) {
+		ret = do_numa_page(mm, vma, address, entry, pte, pmd);
+		goto out;
+	}
 
 	/* wp cases */
 	ptl = pte_lockptr(mm, pmd);
@@ -3834,9 +3852,12 @@ out:
 	if (unlikely(!pte_same(*pte, entry)))
 		goto unlock;
 	if (flags & FAULT_FLAG_WRITE) {
-		if (!pte_write(entry))
-			return do_wp_page(mm, vma, address,
+		if (!pte_write(entry)) {
+			printk("do_wp_page\n");
+			ret = do_wp_page(mm, vma, address,
 					pte, pmd, ptl, entry);
+			goto count;	
+		}
 		entry = pte_mkdirty(entry);
 	}
 	entry = pte_mkyoung(entry);
@@ -3854,7 +3875,28 @@ out:
 	}
 unlock:
 	pte_unmap_unlock(pte, ptl);
-	return 0;
+count:
+	inc_page_ref(pte);
+	counter = get_page_ref(pte);
+	/*if (current->trace_fault)
+		printk("%s(): address: %#lx, count = %d\n", 
+			__func__, address, counter);*/
+	if (counter < 0 || counter >= 10)
+		goto out;
+		
+	fault_pc = get_fault_pc(vma, address);
+	if (fault_pc > 0) {
+		current->last_fault_addr = address;
+		printk("%s(): tsk(%d): save fault address %#lx.\n",
+			__func__, current->pid, current->last_fault_addr);
+		patch_next_inst(mm, fault_pc);
+	}
+out:
+	/*if (current->trace_fault)
+		printk("%s(): tsk(%d) address: %#lx: build pte at %p, pteval: %#lx.\n",
+				__func__, current->pid, address, pte, (unsigned long)pte_val(*pte));*/
+	return ret;
+	//return 0;
 }
 
 /*
@@ -4199,6 +4241,7 @@ int patch_next_inst(struct mm_struct *mm, unsigned long pc)
 	u32 inst = 0xffffffff; /* undefined inst here */
 
 	next_inst_vaddr = find_next_inst(pc);
+	pr_info("pc: %#lx, next inst: %#lx\n", pc, next_inst_vaddr);
 	/* save orig instruction to be patched */
 	memcpy(&current->orig_inst, (void *)next_inst_vaddr, 4);
 	
@@ -4228,6 +4271,11 @@ int clear_pervious_saved_pte(void)
 	spinlock_t *ptl;
 	struct vm_area_struct *vma;
 
+	BUG_ON(current->pid == 1);
+
+	printk("%s(): tsk(%d): restore saved fault address %#lx.\n",
+			__func__, current->pid, current->last_fault_addr);
+
 	vma = find_vma(mm, last_fault_addr);
 	if (unlikely(!vma)) {
 		pr_warn("Cannot find VMA of last fault address.\n");
@@ -4243,12 +4291,76 @@ int clear_pervious_saved_pte(void)
 	}
 
 	entry = *ptep;
-	entry = 0; /* TODO: BUG */
+	printk("%s(): entry = %#lx\n", __func__, (unsigned long)entry);
+	//entry = pte_mkinvalid(pte_mknonfile(entry));
+	/* save pte value to current */
+	current->saved_pteval = entry;
+
+	entry = 0;
 	set_pte_at(mm, last_fault_addr, ptep, entry);
 	flush_tlb_range(vma, aligned_addr, aligned_addr + PAGE_SIZE);
 	current->last_fault_addr = 0;
 
+	printk("%s(): tsk(%d): clear pte at %p, pteval: %#lx.\n",
+		__func__, current->pid, ptep, (unsigned long)pte_val(*ptep));
 	pte_unmap_unlock(ptep, ptl);
+	return 0;
+}
+
+unsigned long user_virt_to_pfn(struct mm_struct *mm, unsigned long address)
+{
+	unsigned long pfn = INT_MAX;
+	int ret;
+	pte_t pteval, *ptep;
+	spinlock_t *ptl;
+
+	ret = follow_pte(mm, address, &ptep, &ptl);
+	if (unlikely(ret)) {
+		goto out;
+	}
+
+	pteval = *ptep;
+	pfn = pte_pfn(pteval);
+
+	pte_unmap_unlock(ptep, ptl);
+out:
+	return pfn;
+}
+
+SYSCALL_DEFINE0(trace_fault)
+{
+	struct vm_area_struct *vma = current->mm->mmap;
+	if (!current->trace_fault) {
+		current->trace_fault = true;
+		return 0;
+	}
+
+	printk("num of VMAs = %d\n", current->mm->map_count);
+	while (vma) {
+		unsigned long curr = vma->vm_start;
+		pr_info("NEW VMA: start %#lx, end %#lx\n", vma->vm_start, vma->vm_end);
+		if (vma->vm_flags & VM_EXEC && !(vma->vm_flags & VM_WRITE))
+			pr_info("CODE VMA !!!\n");
+
+		while (curr < vma->vm_end) {
+			unsigned long pfn;
+			struct page *page;
+			int counter = 0;
+		
+			pfn = user_virt_to_pfn(current->mm, curr);			
+			if (pfn_valid(pfn)) {
+				page = pfn_to_page(pfn);
+				counter = atomic_read(&page->ref);
+			}
+
+			printk("%d ", counter);
+			curr += PAGE_SIZE;
+			
+		}
+		pr_info("\n");
+		vma = vma->vm_next;
+	}
+
 	return 0;
 }
 
@@ -4519,6 +4631,7 @@ void clear_huge_page(struct page *page,
 	might_sleep();
 	for (i = 0; i < pages_per_huge_page; i++) {
 		cond_resched();
+#define L_PTE_FOO		(_AT(pteval_t, 1) << 3) /* only when !PRESENT */
 		clear_user_highpage(page + i, addr + i * PAGE_SIZE);
 	}
 }

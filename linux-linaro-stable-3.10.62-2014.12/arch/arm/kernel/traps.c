@@ -440,6 +440,9 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	if (instr == 0xffffffff) {
 		//printk("FOO!!\n");
 		restore_saved_inst((unsigned long) pc);
+		//printk("restored!!\n");
+		clear_pervious_saved_pte();
+		//printk("cleared!!\n");
 		return;
 	}
 

@@ -6,13 +6,18 @@
 int main()
 {
 	char *buf;
-	int i;
+	int i, j;
 	syscall(59);
 
 	buf = malloc(20 * PAGE_SIZE);
+	printf("buf address: %p\n", buf);
+
 	for (i = 0; i < 20; i++) {
-		buf[i*PAGE_SIZE] = 's';
+		for (j = 0; j < 3; j++)
+			buf[i*PAGE_SIZE] = 's';
 	}
+
+	syscall(59);
 
 	return 0;
 	

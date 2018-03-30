@@ -529,6 +529,7 @@ static struct task_struct *find_new_reaper(struct task_struct *father)
 	if (unlikely(pid_ns->child_reaper == father)) {
 		write_unlock_irq(&tasklist_lock);
 		if (unlikely(pid_ns == &init_pid_ns)) {
+			pr_info("PID: %d\n", current->pid);
 			panic("Attempted to kill init! exitcode=0x%08x\n",
 				father->signal->group_exit_code ?:
 					father->exit_code);

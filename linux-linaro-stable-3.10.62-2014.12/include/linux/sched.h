@@ -1074,6 +1074,7 @@ struct task_struct {
 	bool trace_fault;
 	u32 orig_inst;
 	unsigned long last_fault_addr;
+	pte_t saved_pteval;
 
 	int prio, static_prio, normal_prio;
 	unsigned int rt_priority;

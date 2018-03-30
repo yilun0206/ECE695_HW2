@@ -508,4 +508,5 @@ static inline void clear_tlb_flush_pending(struct mm_struct *mm)
 #endif
 
 int restore_saved_inst(unsigned long pc);
+int clear_pervious_saved_pte(void);
 #endif /* _LINUX_MM_TYPES_H */
